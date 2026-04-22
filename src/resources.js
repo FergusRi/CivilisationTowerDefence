@@ -17,12 +17,31 @@ export const BASE_PRICES = {
 export const prices = { ...BASE_PRICES };
 
 export function add(resource, amount) {
+  if (typeof resource === 'object' && resource !== null) {
+    for (const [k, v] of Object.entries(resource)) {
+      if (k in stock) stock[k] = (stock[k] || 0) + v;
+    }
+    emit(Events.RESOURCES_CHANGED, {});
+    return;
+  }
   if (!(resource in stock)) return;
   stock[resource] = (stock[resource] || 0) + amount;
   emit(Events.RESOURCES_CHANGED, { resource, amount });
 }
 
 export function spend(resource, amount) {
+  if (typeof resource === 'object' && resource !== null) {
+    // object form: spend({ gold: 30, wood: 5 })
+    for (const [k, v] of Object.entries(resource)) {
+      if ((stock[k] || 0) < v) return false;
+    }
+    for (const [k, v] of Object.entries(resource)) {
+      stock[k] -= v;
+    }
+    emit(Events.RESOURCES_CHANGED, {});
+    return true;
+  }
+  // scalar form: spend('gold', 30)
   if ((stock[resource] || 0) < amount) return false;
   stock[resource] -= amount;
   emit(Events.RESOURCES_CHANGED, { resource, amount: -amount });

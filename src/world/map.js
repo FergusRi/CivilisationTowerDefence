@@ -131,7 +131,7 @@ export function scatterSprites(tiles, elevation, rng) {
     for (let tx = 0; tx < MAP_W; tx++) {
       const idx = ty * MAP_W + tx;
       const t = tiles[idx];
-      const e = elevation[idx];
+      const e = elevation ? elevation[idx] : 0.5;   // null-guard: default to mid elevation
       const cx = 125, cy = 125;
       const distSq = (tx - cx) ** 2 + (ty - cy) ** 2;
 

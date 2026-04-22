@@ -78,8 +78,8 @@ window.addEventListener('resize', () => {
 // ═════════════════════════════════════════════════════════════════════════════
 const SEED = 42;
 const rng   = mulberry32(SEED);
-const tiles = generateMap(rng);
-const sprites = scatterSprites(tiles, null, rng);   // elevation not stored separately; noise baked into tiles
+const { tiles, elevation } = generateMap(rng);
+const sprites = scatterSprites(tiles, elevation, rng);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // STEP 3 — Camera

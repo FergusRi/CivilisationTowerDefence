@@ -4,8 +4,8 @@
  * Manages unlock state, cost checks, and fires side-effects on purchase.
  */
 
-import { stock, spend, canAfford, emit } from '../resources.js';
-import { Events } from '../engine/events.js';
+import { stock, spend, canAfford } from '../resources.js';
+import { emit, Events } from '../engine/events.js';
 import { BUILDING, getBuildingDef } from '../buildings/registry.js';
 
 // ── Node definitions ──────────────────────────────────────────────────────────

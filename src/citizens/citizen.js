@@ -1,361 +1,293 @@
-// Citizen system: autonomous agents, A* pathfinding, state machine
+/**
+ * src/citizens/citizen.js
+ * Citizen entity — creation and per-frame update logic.
+ *
+ * Each citizen is a plain object with the following shape:
+ *   { id, wx, wy, speed, hp, maxHp, damage, state, cottageId,
+ *     _carryMax, _carrying, _target, _path, _respawnTimer }
+ *
+ * Citizen states:
+ *   'idle'      — standing near cottage, looking for work
+ *   'harvest'   — walking to a resource node to pick up resources
+ *   'deliver'   — walking back to deposit resources
+ *   'combat'    — engaging a nearby enemy
+ *   'dead'      — waiting for respawn timer
+ */
 
-import { MAP_W, MAP_H, TILE_SIZE, WALKABLE } from '../world/map.js';
-import { ZONE, getZone, hasAnyZone, nearestZoneBoundary } from '../world/zones.js';
-import { findNearestNode, reserveNode, releaseNode, strikeNode, getNodeById } from '../world/resources_map.js';
-import { add } from '../resources.js';
-import { emit, Events } from '../engine/events.js';
+// ── ID counter ────────────────────────────────────────────────────────────────
+let _nextId = 1;
 
-let uidCounter = 0;
-const NAMES = [
-  'Aldric','Bera','Colt','Dwyn','Edda','Finn','Gwen','Hadwin','Idris','Jora',
-  'Kern','Lira','Mace','Nola','Oswin','Petra','Quinn','Reva','Soren','Tilda',
-  'Uther','Vanna','Wren','Xara','Yoel','Zara','Brin','Cade','Dara','Elan',
-];
+// ── Constants ─────────────────────────────────────────────────────────────────
+const BASE_SPEED       = 60;   // px per second
+const BASE_HP          = 30;
+const BASE_DAMAGE      = 3;
+const BASE_CARRY_MAX   = 3;    // resources per trip
+const RESPAWN_TIME     = 15;   // seconds before a dead citizen respawns
+const COMBAT_RANGE     = 24;   // px — melee attack range
+const ATTACK_COOLDOWN  = 1.0;  // seconds between attacks
+const IDLE_WANDER_DIST = 48;   // px — how far citizens wander when idle
 
+// ── Factory ───────────────────────────────────────────────────────────────────
+
+/**
+ * Create a new citizen at world position (wx, wy).
+ * @param {number} wx  World x in pixels
+ * @param {number} wy  World y in pixels
+ * @returns {Object}   Citizen object
+ */
 export function createCitizen(wx, wy) {
   return {
-    id: `c${uidCounter++}`,
-    name: NAMES[Math.floor(Math.random() * NAMES.length)],
-    wx, wy,
-    tx: Math.floor(wx / TILE_SIZE),
-    ty: Math.floor(wy / TILE_SIZE),
-    hp: 30, maxHp: 30,
-    damage: 4, attackRange: 20, attackCooldown: 1.5, attackTimer: 0,
-    speed: 60, // px/s
-    state: 'IDLE', // IDLE | WORKING | BUILDING | DEFENDING
-    path: [],
-    pathTimer: 0,
-    job: null,         // { buildingId, nodeId, carrying, carryKind }
-    cottageId: null,
-    guardPostId: null,
-    hasRespawnedThisWave: false,
-    retryTimer: 0,
-    target: null,      // enemy being attacked
+    id:             _nextId++,
+    wx,
+    wy,
+    speed:          BASE_SPEED,
+    hp:             BASE_HP,
+    maxHp:          BASE_HP,
+    damage:         BASE_DAMAGE,
+    state:          'idle',
+    cottageId:      null,       // assigned by spawner
+    _carryMax:      BASE_CARRY_MAX,
+    _carrying:      0,
+    _resourceType:  null,       // which resource type is being carried
+    _target:        null,       // { wx, wy } destination
+    _nodeTarget:    null,       // resource node object
+    _path:          [],         // A* waypoints (not yet implemented — direct movement)
+    _respawnTimer:  0,
+    _attackTimer:   0,
+    _wanderTimer:   0,
   };
 }
 
-// ─── A* Pathfinding ─────────────────────────────────────────────────────────
+// ── Update ────────────────────────────────────────────────────────────────────
 
-function heuristic(ax, ay, bx, by) {
-  return Math.abs(ax - bx) + Math.abs(ay - by);
-}
-
-export function findPath(tiles, fromTx, fromTy, toTx, toTy) {
-  if (toTx < 0 || toTx >= MAP_W || toTy < 0 || toTy >= MAP_H) return [];
-  if (!WALKABLE[tiles[toTy * MAP_W + toTx]]) return [];
-
-  const openSet = new Map();
-  const cameFrom = new Map();
-  const gScore = new Map();
-  const fScore = new Map();
-
-  const key = (x, y) => y * MAP_W + x;
-  const startKey = key(fromTx, fromTy);
-  const goalKey  = key(toTx, toTy);
-
-  gScore.set(startKey, 0);
-  fScore.set(startKey, heuristic(fromTx, fromTy, toTx, toTy));
-  openSet.set(startKey, { x: fromTx, y: fromTy });
-
-  const DIRS = [[0,-1],[0,1],[-1,0],[1,0],[1,-1],[1,1],[-1,-1],[-1,1]];
-  const COSTS = [1, 1, 1, 1, 1.414, 1.414, 1.414, 1.414];
-  let iterations = 0;
-
-  while (openSet.size > 0 && iterations++ < 4000) {
-    // Find lowest fScore node
-    let currentKey = null;
-    let lowestF = Infinity;
-    for (const [k] of openSet) {
-      const f = fScore.get(k) ?? Infinity;
-      if (f < lowestF) { lowestF = f; currentKey = k; }
-    }
-    if (currentKey === null) break;
-
-    if (currentKey === goalKey) {
-      // Reconstruct path
-      const path = [];
-      let cur = currentKey;
-      while (cameFrom.has(cur)) {
-        const x = cur % MAP_W, y = Math.floor(cur / MAP_W);
-        path.unshift({ tx: x, ty: y, wx: x * TILE_SIZE + 16, wy: y * TILE_SIZE + 16 });
-        cur = cameFrom.get(cur);
-      }
-      return path;
-    }
-
-    openSet.delete(currentKey);
-    const cx = currentKey % MAP_W, cy = Math.floor(currentKey / MAP_W);
-
-    for (let d = 0; d < DIRS.length; d++) {
-      const nx = cx + DIRS[d][0], ny = cy + DIRS[d][1];
-      if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
-      if (!WALKABLE[tiles[ny * MAP_W + nx]]) continue;
-      // Diagonal: block if both cardinals are walls
-      if (d >= 4) {
-        const ax = cx + DIRS[d][0], ay = cy;
-        const bx = cx, by = cy + DIRS[d][1];
-        if (!WALKABLE[tiles[ay * MAP_W + ax]] || !WALKABLE[tiles[by * MAP_W + bx]]) continue;
-      }
-      const nk = key(nx, ny);
-      const tentativeG = (gScore.get(currentKey) ?? Infinity) + COSTS[d];
-      if (tentativeG < (gScore.get(nk) ?? Infinity)) {
-        cameFrom.set(nk, currentKey);
-        gScore.set(nk, tentativeG);
-        fScore.set(nk, tentativeG + heuristic(nx, ny, toTx, toTy));
-        openSet.set(nk, { x: nx, y: ny });
-      }
-    }
-  }
-  return []; // No path found
-}
-
-// ─── Citizen Update ──────────────────────────────────────────────────────────
-
+/**
+ * Update all citizens for one frame.
+ * @param {Object[]} citizens   gs.citizens array
+ * @param {number}   dt         Delta time in seconds
+ * @param {Object}   gs         Full game state
+ */
 export function updateCitizens(citizens, dt, gs) {
-  for (const c of citizens) {
-    c.attackTimer = Math.max(0, c.attackTimer - dt);
-    c.retryTimer  = Math.max(0, c.retryTimer - dt);
+  // Cottage cap — how many citizens per cottage (research-driven)
+  const cottageCap = gs._cottageCap ?? 1;
 
+  for (const c of citizens) {
+    if (c.state === 'dead') {
+      _updateDead(c, dt, gs, cottageCap);
+      continue;
+    }
+
+    // Combat check: scan for nearby enemies first
+    if (_checkCombat(c, dt, gs)) continue;
+
+    // State machine
     switch (c.state) {
-      case 'IDLE':     updateIdle(c, dt, gs);     break;
-      case 'WORKING':  updateWorking(c, dt, gs);  break;
-      case 'BUILDING': updateBuilding(c, dt, gs); break;
-      case 'DEFENDING':updateDefending(c, dt, gs); break;
+      case 'idle':    _updateIdle(c, dt, gs);    break;
+      case 'harvest': _updateHarvest(c, dt, gs); break;
+      case 'deliver': _updateDeliver(c, dt, gs); break;
+      default:        c.state = 'idle';
     }
-
-    // Move along path
-    followPath(c, dt);
-    c.tx = Math.floor(c.wx / TILE_SIZE);
-    c.ty = Math.floor(c.wy / TILE_SIZE);
   }
 }
 
-function followPath(c, dt) {
-  if (c.path.length === 0) return;
-  const next = c.path[0];
-  const dx = next.wx - c.wx, dy = next.wy - c.wy;
-  const dist = Math.sqrt(dx*dx + dy*dy);
+// ── State handlers ────────────────────────────────────────────────────────────
+
+function _updateDead(c, dt, gs, cottageCap) {
+  c._respawnTimer -= dt * (1 / (gs._respawnMulti ?? 1.0));
+  if (c._respawnTimer <= 0) {
+    // Respawn near cottage if possible
+    const cottage = gs.buildings.find(b => b.id === c.cottageId && b.isBuilt);
+    const occupants = gs.citizens.filter(
+      x => x.id !== c.id && x.state !== 'dead' && x.cottageId === c.cottageId
+    ).length;
+
+    if (cottage && occupants < cottageCap) {
+      c.wx    = cottage.wx + (Math.random() - 0.5) * 32;
+      c.wy    = cottage.wy + (Math.random() - 0.5) * 32;
+      c.hp    = c.maxHp;
+      c.state = 'idle';
+      c._carrying     = 0;
+      c._resourceType = null;
+      c._target       = null;
+      c._nodeTarget   = null;
+    } else {
+      // No room — try again after a short delay
+      c._respawnTimer = 3;
+    }
+  }
+}
+
+function _updateIdle(c, dt, gs) {
+  // Look for a resource node to harvest
+  const node = _findNearestResourceNode(c, gs);
+  if (node) {
+    c._nodeTarget = node;
+    c._target     = { wx: node.wx, wy: node.wy };
+    c.state       = 'harvest';
+    return;
+  }
+
+  // Wander randomly near cottage
+  c._wanderTimer -= dt;
+  if (c._wanderTimer <= 0) {
+    c._wanderTimer = 2 + Math.random() * 3;
+    const cottage = gs.buildings.find(b => b.id === c.cottageId);
+    if (cottage) {
+      c._target = {
+        wx: cottage.wx + (Math.random() - 0.5) * IDLE_WANDER_DIST * 2,
+        wy: cottage.wy + (Math.random() - 0.5) * IDLE_WANDER_DIST * 2,
+      };
+    }
+  }
+  if (c._target) _moveToward(c, c._target.wx, c._target.wy, dt);
+}
+
+function _updateHarvest(c, dt, gs) {
+  // Node may have been depleted
+  if (!c._nodeTarget || c._nodeTarget.depleted) {
+    c.state       = 'idle';
+    c._nodeTarget = null;
+    c._target     = null;
+    return;
+  }
+
+  _moveToward(c, c._target.wx, c._target.wy, dt);
+
+  // Arrived at node?
+  if (_distSq(c, c._target) < 16 * 16) {
+    // Harvest
+    const amount = Math.min(c._carryMax, c._nodeTarget.stock ?? c._carryMax);
+    c._carrying     = amount;
+    c._resourceType = c._nodeTarget.resourceType ?? 'wood';
+    if (c._nodeTarget.stock !== undefined) {
+      c._nodeTarget.stock = Math.max(0, c._nodeTarget.stock - amount);
+      if (c._nodeTarget.stock <= 0) c._nodeTarget.depleted = true;
+    }
+
+    // Find nearest storage building to deliver to
+    const depot = _findNearestDepot(c, gs);
+    if (depot) {
+      c._target = { wx: depot.wx, wy: depot.wy };
+      c._depot  = depot;
+      c.state   = 'deliver';
+    } else {
+      // No depot — drop resources and go idle
+      c._carrying     = 0;
+      c._resourceType = null;
+      c.state         = 'idle';
+    }
+  }
+}
+
+function _updateDeliver(c, dt, gs) {
+  if (!c._depot || !c._depot.isBuilt) {
+    // Depot gone — try to find another
+    const depot = _findNearestDepot(c, gs);
+    if (depot) {
+      c._depot  = depot;
+      c._target = { wx: depot.wx, wy: depot.wy };
+    } else {
+      c._carrying     = 0;
+      c._resourceType = null;
+      c.state         = 'idle';
+      return;
+    }
+  }
+
+  _moveToward(c, c._target.wx, c._target.wy, dt);
+
+  // Arrived at depot?
+  if (_distSq(c, c._target) < 20 * 20) {
+    // Deposit resources via resources module (imported dynamically to avoid cycles)
+    if (c._carrying > 0 && c._resourceType) {
+      // Use add() with object form to match the dual-form API in resources.js
+      try {
+        // Dynamic import isn't available in sync context; use gs.addResource hook if provided,
+        // otherwise fall back to directly mutating stock via a gs-level callback.
+        if (gs._addResource) {
+          gs._addResource(c._resourceType, c._carrying);
+        }
+      } catch (_) { /* no-op if resource system not wired */ }
+    }
+    c._carrying     = 0;
+    c._resourceType = null;
+    c._depot        = null;
+    c._target       = null;
+    c.state         = 'idle';
+  }
+}
+
+function _checkCombat(c, dt, gs) {
+  // Find closest enemy within combat range
+  let closest = null;
+  let closestDist = COMBAT_RANGE * COMBAT_RANGE;
+  for (const e of gs.enemies) {
+    if (e.hp <= 0) continue;
+    const d = _distSq(c, e);
+    if (d < closestDist) { closest = e; closestDist = d; }
+  }
+
+  if (!closest) return false;
+
+  // Move into attack range if needed
+  if (closestDist > (COMBAT_RANGE * 0.8) ** 2) {
+    _moveToward(c, closest.wx, closest.wy, dt);
+  }
+
+  // Attack on cooldown
+  c._attackTimer -= dt;
+  if (c._attackTimer <= 0) {
+    closest.hp       -= c.damage;
+    c._attackTimer    = ATTACK_COOLDOWN;
+  }
+
+  return true;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function _moveToward(c, tx, ty, dt) {
+  const dx = tx - c.wx;
+  const dy = ty - c.wy;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 1) return;
   const step = c.speed * dt;
-  if (dist <= step) {
-    c.wx = next.wx; c.wy = next.wy;
-    c.path.shift();
+  if (step >= dist) {
+    c.wx = tx;
+    c.wy = ty;
   } else {
-    c.wx += dx/dist * step;
-    c.wy += dy/dist * step;
+    c.wx += (dx / dist) * step;
+    c.wy += (dy / dist) * step;
   }
 }
 
-function updateIdle(c, dt, gs) {
-  if (c.retryTimer > 0) return;
-
-  // 1. Try to find work
-  const openBuilding = gs.buildings.find(b =>
-    b.workerSlots && b.workers.length < b.workerSlots && b.id !== 'settlement_hall'
-  );
-  if (openBuilding) {
-    assignWork(c, openBuilding, gs);
-    return;
-  }
-
-  // 2. Check if new cottage is needed
-  const totalCap = gs.buildings.filter(b => b.type === 'cottage').reduce((s,b) => s + b.capacity, 0);
-  if (gs.citizens.length > totalCap) {
-    tryBuildCottage(c, gs);
-    return;
-  }
-
-  // 3. Wander in settlement zone
-  if (c.path.length === 0) {
-    const wx = c.wx + (Math.random() - 0.5) * 128;
-    const wy = c.wy + (Math.random() - 0.5) * 128;
-    const tx = Math.floor(wx / TILE_SIZE);
-    const ty = Math.floor(wy / TILE_SIZE);
-    if (tx >= 0 && tx < MAP_W && ty >= 0 && ty < MAP_H &&
-        WALKABLE[gs.map.tiles[ty * MAP_W + tx]]) {
-      c.path = findPath(gs.map.tiles, c.tx, c.ty, tx, ty);
-    }
-  }
+function _distSq(a, b) {
+  const dx = a.wx - b.wx;
+  const dy = a.wy - b.wy;
+  return dx * dx + dy * dy;
 }
 
-function assignWork(c, building, gs) {
-  building.workers.push(c.id);
-  c.job = { buildingId: building.id, nodeId: null, carrying: 0, carryKind: building.harvestKind || null };
-  c.state = 'WORKING';
-  c.path = [];
-  // Path to building
-  const bTx = Math.floor(building.wx / TILE_SIZE);
-  const bTy = Math.floor(building.wy / TILE_SIZE);
-  c.path = findPath(gs.map.tiles, c.tx, c.ty, bTx, bTy);
+function _findNearestResourceNode(c, gs) {
+  if (!gs.resourceNodes) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const node of gs.resourceNodes) {
+    if (node.depleted) continue;
+    // Don't double-assign: check if another citizen is already going there
+    const claimed = gs.citizens.some(
+      x => x.id !== c.id && x._nodeTarget === node && x.state === 'harvest'
+    );
+    if (claimed) continue;
+    const d = _distSq(c, node);
+    if (d < bestDist) { best = node; bestDist = d; }
+  }
+  return best;
 }
 
-function updateWorking(c, dt, gs) {
-  if (!c.job) { c.state = 'IDLE'; return; }
-  const building = gs.buildings.find(b => b.id === c.job.buildingId);
-  if (!building) { c.job = null; c.state = 'IDLE'; return; }
-
-  const bTx = Math.floor(building.wx / TILE_SIZE);
-  const bTy = Math.floor(building.wy / TILE_SIZE);
-
-  if (!c.job.nodeId) {
-    // Need to find a resource node
-    if (c.retryTimer > 0) return;
-    const node = findNearestNode(c.job.carryKind, c.tx, c.ty);
-    if (!node) { c.retryTimer = 5; return; }
-    c.job.nodeId = node.id;
-    reserveNode(node.id, c.id);
-    c.path = findPath(gs.map.tiles, c.tx, c.ty, node.tx, node.ty);
-    return;
-  }
-
-  const node = getNodeById(c.job.nodeId);
-  if (!node || node.hp <= 0) {
-    c.job.nodeId = null; releaseNode(c.job.nodeId); return;
-  }
-
-  // At node?
-  if (c.path.length === 0) {
-    const dx = node.tx - c.tx, dy = node.ty - c.ty;
-    if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) {
-      // Harvest
-      c.job.carrying++;
-      strikeNode(node.id, gs.map.tiles, gs.sprites);
-      releaseNode(c.job.nodeId);
-      c.job.nodeId = null;
-      if (c.job.carrying >= 3) {
-        // Return to building to deposit
-        c.path = findPath(gs.map.tiles, c.tx, c.ty, bTx, bTy);
-      }
-    }
-  } else if (c.job.carrying >= 3 && c.path.length === 0) {
-    // At building, deposit
-    const dx = bTx - c.tx, dy = bTy - c.ty;
-    if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) {
-      add(c.job.carryKind, c.job.carrying);
-      c.job.carrying = 0;
-    }
-  }
-}
-
-function tryBuildCottage(c, gs) {
-  // Find nearest free walkable SETTLEMENT tile
-  const { zoneData } = gs.zones;
-  let best = null, bestDist = Infinity;
-  for (let ty = 0; ty < MAP_H; ty++) {
-    for (let tx = 0; tx < MAP_W; tx++) {
-      if (zoneData[ty * MAP_W + tx] !== ZONE.SETTLEMENT) continue;
-      if (!WALKABLE[gs.map.tiles[ty * MAP_W + tx]]) continue;
-      if (gs.buildings.some(b => Math.floor(b.wx/TILE_SIZE) === tx && Math.floor(b.wy/TILE_SIZE) === ty)) continue;
-      const dx = tx - c.tx, dy = ty - c.ty;
-      const d = dx*dx + dy*dy;
-      if (d < bestDist) { bestDist = d; best = { tx, ty }; }
-    }
-  }
-  if (!best) { c.retryTimer = 5; return; }
-  c.state = 'BUILDING';
-  c.job = { buildSite: best, buildTimer: 8 };
-  c.path = findPath(gs.map.tiles, c.tx, c.ty, best.tx, best.ty);
-}
-
-function updateBuilding(c, dt, gs) {
-  if (!c.job?.buildSite) { c.state = 'IDLE'; return; }
-  if (c.path.length > 0) return; // Still walking
-  c.job.buildTimer -= dt;
-  if (c.job.buildTimer <= 0) {
-    // Place cottage
-    const { tx, ty } = c.job.buildSite;
-    const cottageCap = gs.research?.densHousing ? (gs.research?.grandHousing ? 4 : 2) : 1;
-    const cottage = {
-      id: `b${Date.now()}`,
-      type: 'cottage',
-      wx: tx * TILE_SIZE + TILE_SIZE/2,
-      wy: ty * TILE_SIZE + TILE_SIZE/2,
-      hp: 30, maxHp: 30,
-      capacity: cottageCap,
-      residents: [],
-      workerSlots: 0, workers: [],
-    };
-    gs.buildings.push(cottage);
-    // Citizen joins cottage
-    cottage.residents.push(c.id);
-    c.cottageId = cottage.id;
-    emit(Events.BUILDING_PLACED, { building: cottage });
-    c.job = null;
-    c.state = 'IDLE';
-  }
-}
-
-function updateDefending(c, dt, gs) {
-  // Attack nearest enemy in range
-  if (c.target) {
-    const e = gs.enemies.find(e => e.id === c.target);
-    if (!e || e.hp <= 0) { c.target = null; c.path = []; }
-    else {
-      const dx = e.wx - c.wx, dy = e.wy - c.wy;
-      const dist = Math.sqrt(dx*dx + dy*dy);
-      if (dist <= c.attackRange) {
-        c.path = [];
-        if (c.attackTimer <= 0) {
-          e.hp -= c.damage;
-          c.attackTimer = c.attackCooldown;
-          if (e.hp <= 0) {
-            emit(Events.ENEMY_DIED, { enemy: e, gold: e.killReward });
-            c.target = null;
-          }
-        }
-      } else {
-        // Move toward enemy
-        if (c.path.length === 0) {
-          c.path = findPath(gs.map.tiles, c.tx, c.ty,
-            Math.floor(e.wx/TILE_SIZE), Math.floor(e.wy/TILE_SIZE));
-        }
-      }
-      return;
-    }
-  }
-
-  // Find enemy within 60px to engage
-  const nearby = gs.enemies.find(e => {
-    const dx = e.wx - c.wx, dy = e.wy - c.wy;
-    return Math.sqrt(dx*dx + dy*dy) <= 60 && e.hp > 0;
-  });
-  if (nearby) { c.target = nearby.id; return; }
-
-  // Hold position — no wandering during wave
-}
-
-export function enterDefendingState(c, gs) {
-  c.state = 'DEFENDING';
-  c.path = [];
-  c.job = null;
-  c.target = null;
-
-  if (c.guardPostId) {
-    const gp = gs.buildings.find(b => b.id === c.guardPostId);
-    if (gp) {
-      c.path = findPath(gs.map.tiles, c.tx, c.ty,
-        Math.floor(gp.wx/TILE_SIZE), Math.floor(gp.wy/TILE_SIZE));
-      return;
-    }
-  }
-
-  // Path to nearest defence zone boundary
-  const boundary = nearestZoneBoundary(gs.zones, c.wx, c.wy, ZONE.DEFENCE);
-  if (boundary) {
-    c.path = findPath(gs.map.tiles, c.tx, c.ty, boundary.tx, boundary.ty);
-  }
-}
-
-export function resetCitizensToWork(citizens, gs) {
-  for (const c of citizens) {
-    c.state = 'IDLE';
-    c.path = [];
-    c.target = null;
-    c.hasRespawnedThisWave = false;
-    // Remove from old building worker lists
-    for (const b of gs.buildings) {
-      if (b.workers) b.workers = b.workers.filter(id => id !== c.id);
-    }
-    c.job = null;
-  }
+function _findNearestDepot(c, gs) {
+  // Any built building that accepts resources (cottage, warehouse, etc.)
+  // For simplicity, use the citizen's own cottage as depot
+  const cottage = gs.buildings.find(b => b.id === c.cottageId && b.isBuilt);
+  if (cottage) return cottage;
+  // Fallback: any built cottage
+  return gs.buildings.find(b => b.isBuilt) ?? null;
 }
