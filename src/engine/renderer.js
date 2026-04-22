@@ -69,7 +69,8 @@ function render() {
 
 function drawTiles(W, H) {
   if (!gameState.map) return;
-  const { tiles } = gameState.map;
+  // gs.map is the raw Uint8Array of tile IDs (set in main.js as `map: tiles`)
+  const tiles = gameState.map;
   const { x0, y0, x1, y1 } = visibleTileRange(W, H, TILE_SIZE, MAP_W, MAP_H);
 
   for (let ty = y0; ty <= y1; ty++) {
