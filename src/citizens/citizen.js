@@ -291,3 +291,38 @@ function _findNearestDepot(c, gs) {
   // Fallback: any built cottage
   return gs.buildings.find(b => b.isBuilt) ?? null;
 }
+
+// ── Phase transition hooks ────────────────────────────────────────────────────
+
+/**
+ * Called when a wave starts — switches citizen into combat-ready state.
+ * Drops any carried resources and clears work targets so the combat
+ * check in updateCitizens takes over immediately.
+ * @param {Object} c   Citizen object
+ * @param {Object} gs  Full game state
+ */
+export function enterDefendingState(c, gs) {
+  if (c.state === 'dead') return;
+  c._carrying     = 0;
+  c._resourceType = null;
+  c._nodeTarget   = null;
+  c._depot        = null;
+  c._target       = null;
+  c.state         = 'idle';   // combat check runs first each frame, so 'idle' is fine
+}
+
+/**
+ * Called when a wave ends — resets all citizens back to work.
+ * Clears attack state so they resume harvesting on next frame.
+ * @param {Object[]} citizens  gs.citizens array
+ * @param {Object}   gs        Full game state
+ */
+export function resetCitizensToWork(citizens, gs) {
+  for (const c of citizens) {
+    if (c.state === 'dead') continue;
+    c._attackTimer  = 0;
+    c._target       = null;
+    c._nodeTarget   = null;
+    c.state         = 'idle';
+  }
+}
